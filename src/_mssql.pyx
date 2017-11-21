@@ -31,10 +31,6 @@ DEF MSSQLDB_MSGSIZE = 1024
 DEF PYMSSQL_MSGSIZE = (MSSQLDB_MSGSIZE * 8)
 DEF EXCOMM = 9
 
-# Provide constants missing in FreeTDS 0.82 so that we can build against it
-DEF DBVERSION_71 = 5
-DEF DBVERSION_72 = 6
-
 ROW_FORMAT_TUPLE = 1
 ROW_FORMAT_DICT = 2
 
@@ -135,6 +131,10 @@ SQLTEXT = SYBTEXT
 SQLVARBINARY = SYBVARBINARY
 SQLVARCHAR = SYBVARCHAR
 SQLUUID = 36
+
+SQLDATE = 40
+SQLTIME = 41
+SQLDATETIME2 = 42
 
 #######################
 ## Exception classes ##
@@ -253,7 +253,8 @@ cdef int err_handler(DBPROCESS *dbproc, int severity, int dberr, int oserr,
         mssql_lastmsgstate = &(<MSSQLConnection>conn).last_msg_state
         if DBDEAD(dbproc):
             log("+++ err_handler: dbproc is dead; killing conn...\n")
-            #conn.mark_disconnected()
+            # Mark connection disconnected. Disconnected connections are
+            # "collected" at next interaction via cancel() method.
             conn._connected = 0
         break
 
@@ -518,7 +519,7 @@ cdef class MSSQLConnection:
             elif version == 10:
                 return 7.2
             elif version == 9:
-                return 8.0  # Actually 7.1, return 8.0 to keep backward compatibility
+                return 7.1
             elif version == 8:
                 return 7.0
             elif version == 6:
@@ -541,7 +542,7 @@ cdef class MSSQLConnection:
         self.column_types = None
 
     def __init__(self, server="localhost", user="sa", password="",
-            charset='UTF-8', database='', appname=None, port='1433', tds_version='7.1', conn_properties=None):
+            charset='UTF-8', database='', appname=None, port='1433', tds_version=None, conn_properties=None):
         log("_mssql.MSSQLConnection.__init__()")
 
         cdef LOGINREC *login
@@ -575,7 +576,8 @@ cdef class MSSQLConnection:
         DBSETLUSER(login, user_cstr)
         DBSETLPWD(login, password_cstr)
         DBSETLAPP(login, appname_cstr)
-        DBSETLVERSION(login, _tds_ver_str_to_constant(tds_version))
+        if tds_version is not None:
+            DBSETLVERSION(login, _tds_ver_str_to_constant(tds_version))
 
         # add the port to the server string if it doesn't have one already and
         # if we are not using an instance
@@ -743,7 +745,6 @@ cdef class MSSQLConnection:
         with nogil:
             dbclose(self.dbproc)
 
-        #self.mark_disconnected()
         self._real_close()
 
     def _real_close(self):
@@ -814,12 +815,24 @@ cdef class MSSQLConnection:
                 ctx.prec = precision if precision > 0 else 1
                 return decimal.Decimal(_remove_locale(buf, converted_length).decode(self._charset))
 
-        elif dbtype == SQLDATETIM4:
+        elif dbtype in (SQLDATETIM4, SQLDATETIME2):
             dbconvert(self.dbproc, dbtype, data, -1, SQLDATETIME,
                 <BYTE *>&dt, -1)
             dbdatecrack(self.dbproc, &di, <DBDATETIME *><BYTE *>&dt)
             return datetime.datetime(di.year, di.month, di.day,
                 di.hour, di.minute, di.second, di.millisecond * 1000)
+
+        elif dbtype == SQLDATE:
+            dbconvert(self.dbproc, dbtype, data, -1, SQLDATETIME,
+                <BYTE *>&dt, -1)
+            dbdatecrack(self.dbproc, &di, <DBDATETIME *><BYTE *>&dt)
+            return datetime.date(di.year, di.month, di.day)
+
+        elif dbtype == SQLTIME:
+            dbconvert(self.dbproc, dbtype, data, -1, SQLDATETIME,
+                <BYTE *>&dt, -1)
+            dbdatecrack(self.dbproc, &di, <DBDATETIME *><BYTE *>&dt)
+            return datetime.time(di.hour, di.minute, di.second, di.millisecond * 1000)
 
         elif dbtype == SQLDATETIME:
             dbdatecrack(self.dbproc, &di, <DBDATETIME *>data)
