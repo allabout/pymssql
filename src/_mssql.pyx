@@ -31,6 +31,9 @@ DEF MSSQLDB_MSGSIZE = 1024
 DEF PYMSSQL_MSGSIZE = (MSSQLDB_MSGSIZE * 8)
 DEF EXCOMM = 9
 
+# Provide constant missing from FreeTDS 0.91 so that we can build against it
+DEF DBVERSION_73 = 7
+
 ROW_FORMAT_TUPLE = 1
 ROW_FORMAT_DICT = 2
 
@@ -60,7 +63,7 @@ from cpython.long cimport PY_LONG_LONG
 from cpython.ref cimport Py_INCREF
 from cpython.tuple cimport PyTuple_New, PyTuple_SetItem
 
-cdef extern from "pymssql_version.h":
+cdef extern from "version.h":
     const char *PYMSSQL_VERSION
 
 cdef extern from "cpp_helpers.h":
@@ -91,7 +94,8 @@ cdef int MIN_INT = -2147483648
 
 # Store the module version
 __full_version__ = PYMSSQL_VERSION.decode('ascii')
-__version__ = '.'.join(__full_version__.split('.')[:3]) # drop '.dev' from 'X.Y.Z.dev'
+__version__ = '.'.join(__full_version__.split('.')[:3])
+VERSION = tuple(int(c) for c in __full_version__.split('.')[:3])
 
 #############################
 ## DB-API type definitions ##
@@ -253,9 +257,7 @@ cdef int err_handler(DBPROCESS *dbproc, int severity, int dberr, int oserr,
         mssql_lastmsgstate = &(<MSSQLConnection>conn).last_msg_state
         if DBDEAD(dbproc):
             log("+++ err_handler: dbproc is dead; killing conn...\n")
-            # Mark connection disconnected. Disconnected connections are
-            # "collected" at next interaction via cancel() method.
-            conn._connected = 0
+            conn.mark_disconnected()
         break
 
     if severity > mssql_lastmsgseverity[0]:
@@ -398,7 +400,7 @@ cdef int db_sqlok(DBPROCESS *dbproc):
     return rtc
 
 cdef void clr_err(MSSQLConnection conn):
-    if conn != None and conn in connection_object_list:
+    if conn != None:
         conn.last_msg_no = 0
         conn.last_msg_severity = 0
         conn.last_msg_state = 0
@@ -526,6 +528,29 @@ cdef class MSSQLConnection:
                 return 5.0
             elif version == 4:
                 return 4.2
+            return None
+
+    property tds_version_tuple:
+        """
+        Reports what TDS version the connection is using in tuple form which is
+        more easily handled (parse, compare) programmatically. If no TDS
+        version can be detected the value is None.
+        """
+        def __get__(self):
+            cdef int version = dbtds(self.dbproc)
+            if version == 11:
+                return (7, 3)
+            elif version == 10:
+                return (7, 2)
+            elif version == 9:
+                return (7, 1)
+            elif version == 8:
+                return (7, 0)
+            elif version == 6:
+                return (5, 0)
+            elif version == 4:
+                return (4, 2)
+            return None
 
     def __cinit__(self):
         log("_mssql.MSSQLConnection.__cinit__()")
@@ -541,7 +566,7 @@ cdef class MSSQLConnection:
         self.column_names = None
         self.column_types = None
 
-    def __init__(self, server="localhost", user="sa", password="",
+    def __init__(self, server="localhost", user=None, password=None,
             charset='UTF-8', database='', appname=None, port='1433', tds_version=None, conn_properties=None):
         log("_mssql.MSSQLConnection.__init__()")
 
@@ -566,15 +591,23 @@ cdef class MSSQLConnection:
         appname = appname or "pymssql=%s" % __full_version__
 
         # For Python 3, we need to convert unicode to byte strings
-        cdef bytes user_bytes = user.encode('utf-8')
-        cdef char *user_cstr = user_bytes
-        cdef bytes password_bytes = password.encode('utf-8')
-        cdef char *password_cstr = password_bytes
+        cdef bytes user_bytes
+        cdef char *user_cstr = NULL
+        if user is not None:
+            user_bytes = user.encode('utf-8')
+            user_cstr = user_bytes
+        cdef bytes password_bytes
+        cdef char *password_cstr = NULL
+        if password is not None:
+            password_bytes = password.encode('utf-8')
+            password_cstr = password_bytes
         cdef bytes appname_bytes = appname.encode('utf-8')
         cdef char *appname_cstr = appname_bytes
 
-        DBSETLUSER(login, user_cstr)
-        DBSETLPWD(login, password_cstr)
+        if user is not None:
+            DBSETLUSER(login, user_cstr)
+        if password is not None:
+            DBSETLPWD(login, password_cstr)
         DBSETLAPP(login, appname_cstr)
         if tds_version is not None:
             DBSETLVERSION(login, _tds_ver_str_to_constant(tds_version))
@@ -745,25 +778,17 @@ cdef class MSSQLConnection:
         with nogil:
             dbclose(self.dbproc)
 
-        self._real_close()
+        self.mark_disconnected()
 
-    def _real_close(self):
-        """
-        Free resources used by this object.
-        """
-        log("_mssql.MSSQLConnection.real_close()")
-        try:
-            connection_object_list.remove(self)
-        except ValueError:
-            pass
-        # Mark connection disconnected. Disconnected connections are
-        # "collected" at next interaction via cancel() method.
-        self._connected = 0
+    def mark_disconnected(self):
+        log("_mssql.MSSQLConnection.mark_disconnected()")
         self.dbproc = NULL
+        self._connected = 0
         PyMem_Free(self.last_msg_proc)
         PyMem_Free(self.last_msg_srv)
         PyMem_Free(self.last_msg_str)
         PyMem_Free(self._charset)
+        connection_object_list.remove(self)
 
     cdef object convert_db_value(self, BYTE *data, int dbtype, int length):
         log("_mssql.MSSQLConnection.convert_db_value()")
@@ -981,8 +1006,10 @@ cdef class MSSQLConnection:
             return 0
 
         if dbtype[0] in (SQLBINARY, SQLVARBINARY, SQLIMAGE):
-            if type(value) is not str:
-                raise TypeError('value can only be str')
+            if PY_MAJOR_VERSION == 3 and type(value) not in (bytes, bytearray):
+                raise TypeError('value can only be bytes or bytearray')
+            elif PY_MAJOR_VERSION == 2 and type(value) not in (str, bytearray):
+                raise TypeError('value can only be str or bytearray')
 
             binValue = <BYTE *>PyMem_Malloc(len(value))
             memcpy(binValue, <char *>value, len(value))
@@ -1718,12 +1745,12 @@ cdef int _tds_ver_str_to_constant(verstr) except -1:
         return DBVERSION_42
     if verstr == u'7.0':
         return DBVERSION_70
-    if verstr == u'7.1':
+    if verstr in (u'7.1', u'8.0'):
         return DBVERSION_71
     if verstr == u'7.2':
         return DBVERSION_72
-    if verstr == u'8.0':
-        return DBVERSION_80
+    if verstr == u'7.3':
+        return DBVERSION_73
     raise MSSQLException('unrecognized tds version: %s' % verstr)
 
 #######################
